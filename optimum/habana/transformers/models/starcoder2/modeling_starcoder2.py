@@ -40,6 +40,7 @@ def gaudi_starcoder2_attention_forward(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    reuse_cache: Optional[bool] = False,
     token_idx: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -48,6 +49,7 @@ def gaudi_starcoder2_attention_forward(
     The only differences are:
     - add new args token_idx
     - optimize KV cache
+    - add new args reuse_cache
     """
     if "padding_mask" in kwargs:
         warnings.warn(
@@ -74,7 +76,10 @@ def gaudi_starcoder2_attention_forward(
             )
         if token_idx is not None and past_key_value.get_usable_length(kv_seq_len, self.layer_idx) > 0:
             # When token_idx is used, static seq len = (input token len + max output token len)
-            kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if reuse_cache:
+                kv_seq_len = past_key_value[0][-2]
+            else:
+                kv_seq_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
@@ -86,13 +91,19 @@ def gaudi_starcoder2_attention_forward(
                 past_key_value.key_cache[self.layer_idx].index_copy_(2, token_idx - 1, key_states)
                 past_key_value.value_cache[self.layer_idx].index_copy_(2, token_idx - 1, value_states)
                 key_states = past_key_value.key_cache[self.layer_idx]
-                value_states = past_key_value.value_cache[self.layer_idx]
+                value_states = past_key_value.value_cache[self.layer_idx]    
             else:
                 past_key_value.key_cache.append(key_states)
                 past_key_value.value_cache.append(value_states)
         else:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+    else:
+         past_key = torch.zeros(key_states.shape, dtype=self.k_proj.weight.dtype, device=key_states.device)
+         past_value = torch.zeros(
+                 key_states.shape, dtype=self.k_proj.weight.dtype, device=key_states.device
+                )
+         past_key_value = (past_key, past_value)
 
     # repeat k/v heads if n_kv_heads < n_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -150,6 +161,7 @@ class GaudiStarcoder2DecoderLayer(Starcoder2DecoderLayer):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        reuse_cache: Optional[bool] = False,
         token_idx: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
@@ -171,6 +183,7 @@ class GaudiStarcoder2DecoderLayer(Starcoder2DecoderLayer):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            reuse_cache = reuse_cache,
             token_idx=token_idx,
         )
         hidden_states = residual + hidden_states
@@ -199,7 +212,8 @@ def gaudi_starcoder2_model_forward(
     position_ids: Optional[torch.LongTensor] = None,
     past_key_values: Optional[List[torch.FloatTensor]] = None,
     inputs_embeds: Optional[torch.FloatTensor] = None,
-    use_cache: Optional[bool] = None,
+    use_cache: Optional[bool] = False,
+    reuse_cache: Optional[bool] = False,
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
@@ -296,6 +310,7 @@ def gaudi_starcoder2_model_forward(
                 past_key_values,
                 output_attentions,
                 use_cache,
+                reuse_cache,
                 None,
             )
         else:
@@ -306,6 +321,7 @@ def gaudi_starcoder2_model_forward(
                 past_key_value=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                reuse_cache,
                 token_idx=token_idx,
             )
 
@@ -347,6 +363,7 @@ class GaudiStarcoder2ForCausalLM(Starcoder2ForCausalLM):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        reuse_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -371,6 +388,7 @@ class GaudiStarcoder2ForCausalLM(Starcoder2ForCausalLM):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            reuse_cache = reuse_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -473,6 +491,7 @@ class GaudiStarcoder2ForCausalLM(Starcoder2ForCausalLM):
                 "position_ids": position_ids,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
+                "reuse_cache": kwargs.get("reuse_cache"),
                 "attention_mask": attention_mask,
                 "token_idx": token_idx,
             }
